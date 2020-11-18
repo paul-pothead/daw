@@ -1,5 +1,7 @@
 module Planner where
 
+import Data.Bifunctor
+
 import qualified Audio as A
 import qualified Data.List as L
 import qualified Data.Map as M
@@ -91,7 +93,6 @@ applyFX quarterSamples =
 data Chunk = Chunk
   {chunkStart  :: Double,
    chunkEnd    :: Double,
-   slaveStart  :: Int,
    link        :: [Int],
    routing     :: A.Routing}
 
@@ -108,23 +109,19 @@ data Track = Bus
   {raggedName :: String,
    schedule   :: [Chunk],
    raggedFX   :: [Effect],
-   pool       :: Array Track}
-  | Source
+   pool       :: Array Source}
+
+data Source = Source
   {sourceName :: String,
    speed    :: Double,
    sourceFX   :: [Effect],
    audio    :: A.Audio}
 
-isRagged (Ragged _ _ _ _) = True
-isRagged _ = False
 
-mix :: [(A.Audio, Track)] -> (A.Audio, [Track])
-mix audioList =
-  (A.mixAudio $ map fst audioList, map snd audioList)
+mix = first A.mixAudio . unzip
 
-
-fromSource :: Int -> Int -> Int -> Track -> (A.Audio, Track)
-fromSource quarterSamp at until (Source name speed fx audio) =
+fromSource :: Int -> (Int, Int) -> Source -> (A.Audio, Source)
+fromSource quarterSamp (at, until) (Source name speed fx audio) =
   (out, Source name speed newFX audio)
 
   where at' = round $ fromIntegral at * speed
@@ -133,42 +130,28 @@ fromSource quarterSamp at until (Source name speed fx audio) =
         (out, newFX) = applyFX quarterSamp toSend fx
 
 
-fromRagged :: [Tempo] -> Int -> Double -> Int -> Track -> (A.Audio, Track)
-fromRagged tempi rate slider buffSamp (Ragged name schedule fx pool) =
-  (out, Ragged name schedule newFX newPool)
+fromTrack :: Int
+           -> ([Chunk] -> [Chunk])
+           -> (Chunk -> (Int, Int))
+           -> Track
+           -> (A.Audio, Track)
+fromTrack quartSamp inScope borders (Ragged name schedule fx pool) =
+  let continue chunk = A.route (routing chunk) `first`
+        fromSource quartSamp (borders chunk) (pool `aget` link chunk)
+      visible = inScope schedule
+      (raw, newSources) = mix $ continue <$> visible
+      (out, newFX) = applyFX quartSamp raw fx
+      newPool = pool `aset` zip (link <$> visible) newSources
+  in (out, Ragged name schedule newFX newPool)
 
-  where quarterSamp = noteSamples rate slider 4 tempi
-        end = slider + bufferBeats rate slider (fromIntegral buffSamp) tempi
-        inScope = pickChunks slider end schedule
-
-        continue chunk = (A.route (routing chunk) out, newTrack)
-          where slave = aget pool $ link chunk
-                offset = windowSamples rate (chunkStart chunk) slider tempi
-                at = slaveStart chunk + offset
-                until = at + buffSamp
-                (out, newTrack) = fromSource quarterSamp at until slave
-        
-        (raw, newTracks) = mix $ map continue inScope
-        (out, newFX) = applyFX quarterSamp raw fx
-        newPool = aset pool $ zip (map link inScope) newTracks
-
-
-fromBus :: [Tempo] -> Int -> Double -> Int -> Track -> (A.Audio, Track)
-fromBus tempi rate slider buffSamp (Bus name controls fx) =
-  (out, Bus name nowControls newFX)
-
-  where quarterSamp = noteSamples rate slider 4 tempi
-
-        continue (routing, track) = (A.route routing out, newTrack)
-          where (out, newTrack) =
-                 (if isRagged track
-                  then fromRagged
-                  else fromBus) tempi rate slider buffSamp track
-
-        (raw, newTracks) = mix $ map continue controls
-        nowControls = zip (map fst controls) newTracks
-        (out, newFX) = applyFX quarterSamp raw fx
-
+fromTrack quartSamp inScope borders (Bus name controls fx) =
+  let continue (routing, track) = A.route routing `first`
+        fromTrack quartSamp inScope borders track
+      (raw, newTracks) = mix $ continue <$> controls
+      nowControls = zip (fst <$> controls) newTracks
+      (out, newFX) = applyFX quartSamp raw fx 
+  in (out, Bus name nowControls newFX)
+ 
 
 data Project = Project
   {name    :: String,
@@ -177,5 +160,23 @@ data Project = Project
    slider  :: Double,
    rate    :: Int,
    buffLen :: Int}
+
+fill :: Project -> (A.Audio, Project)
+fill p@(Project name tempi master slider rate buffLen) =
+  (out, p {slider=newSlider, master=newMaster})
+  where quartSamp = noteSamples rate slider 4 tempi
+        newSlider = slider
+                  + bufferBeats rate slider (fromIntegral buffLen) tempi
+        inScope = pickChunks slider newSlider
+        borders chunk =
+          let at = windowSamples rate slider (chunkStart chunk) tempi
+              until = at + buffLen
+          in (at, until)
+        (out, newMaster) = fromTrack quartSamp inScope borders master
+
+
+
+
+
 
 
