@@ -118,7 +118,13 @@ data Source = Source
    audio    :: A.Audio}
 
 
-mix = first A.mixAudio . unzip
+class Mixable m where
+  mix :: [(A.Audio, m)] -> (A.Audio, [m])
+  mix = first A.mixAudio . unzip
+
+instance Mixable Source
+instance Mixable Track
+
 
 fromSource :: Int -> (Int, Int) -> Source -> (A.Audio, Source)
 fromSource quarterSamp (at, until) (Source name speed fx audio) =
