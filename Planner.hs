@@ -10,13 +10,16 @@ import qualified Data.List as L
 import qualified Data.Map as M
 import qualified Data.Sequence as Q
 
-import Array (aget, aset, Array, MultiIndex)
+import Array (aget, aset, Array, MultiIndex, aimap, flatIdx)
 
 compareBy f a b = f a `compare` f b
 
 data Tempo = Tempo
   {tempoStart :: Double,
    bpm        :: Double}
+
+{- consider caching tempo maps on each slider tick, if it performs
+   lousy. O(1) access time is not guaranteed by the compiler-}
 
 defaultTempi = [Tempo 0 120] 
 
@@ -29,6 +32,9 @@ setTempo slider bpm =
   . deleteTempo slider
 
 
+
+{- be extra careful, I screwed those functions when renaming
+   variables several times and didn't notice -}
 
 tick :: Double -> Double -> Double -> [Tempo] -> Double
 tick rate slider buffSamp (t1 : ts)
@@ -48,7 +54,7 @@ softTempoChange :: Int -> Double -> [Tempo] -> [Tempo]
 softTempoChange n slider (t1 : ts)
 
   | null ts || slider < tempoStart t1 =
-      E.throw $ E.IndexOutOfBounds ""
+      E.throw $ E.IndexOutOfBounds "you should catch this"
 
   | slider >= tempoStart t2 = t1 : softTempoChange n slider ts
 
@@ -56,9 +62,8 @@ softTempoChange n slider (t1 : ts)
     [slider, slider + l ..] [bpm t1, bpm t1 + d ..] ++ ts
   
   where t2 = head ts
-        l = (tempoStart t2 - slider) / fromIntegral n
-        d = (bpm t2 - bpm t1) / fromIntegral n
-
+        l  = (tempoStart t2 - slider) / fromIntegral n
+        d  = (bpm t2 - bpm t1) / fromIntegral n
 
 
 window :: Double -> Double -> Double -> [Tempo] -> Double
@@ -103,12 +108,9 @@ data Chunk = Chunk
    chunkEnd    :: Double,
    slaveStart  :: Int,
    slaveEnd    :: Int,
-   speed       :: Double,
    chunkFX     :: [Effect],
    link        :: Either MultiIndex A.OnDisk,
    routing     :: A.Routing}
-
-
 
 
 data Track = Bus
@@ -117,26 +119,24 @@ data Track = Bus
    busFX     :: [Effect]}
   | Ragged
   {raggedName   :: String,
-   schedule     :: [Chunk],
+   schedules    :: [[Chunk]],
    raggedFX     :: [Effect],
    pool         :: Array A.OnDisk}
 
 
-class Mixable m where
-  mix :: [(A.Audio, m)] -> (A.Audio, [m])
-  mix = first A.mixAudio . unzip
-
-instance Mixable Track
-instance Mixable Chunk
+{- class declaration here is actually superfluous -}
+mix :: [(A.Audio, m)] -> (A.Audio, [m])
+mix = first A.mixAudio . unzip
 
 
 fromTrack :: Double
           -> (Chunk -> Bool)
+          -> (Chunk -> Double)
           -> (Double -> (Double, Double))
           -> Track
           -> (A.Audio, Track)
 
-fromTrack quartSamp inScope borders t@(Ragged _ schedule fx pool) =
+fromTrack quartSamp inScope speed borders t@(Ragged {..}) =
 
   let continue c@(Chunk {..})
         | inScope c = (out, c {chunkFX=newFX})
@@ -145,22 +145,24 @@ fromTrack quartSamp inScope borders t@(Ragged _ schedule fx pool) =
               source = case onDisk of
                 (A.Unloaded _) -> error "you shouldn't load on playback"
                 (A.Loaded _ source) -> source
-              realPos      = round . (speed *)
+              realPos      = round . (* speed c)
               (at, len)    = bimap realPos realPos $ borders chunkStart
               sliced       = A.sliceAudio slaveStart slaveEnd at len source
               routed       = A.route routing sliced
               (out, newFX) = applyFX quartSamp routed chunkFX
-      
-      (raw, newSchedule) = mix $ continue <$> schedule
-      (out, newFX) = applyFX quartSamp raw fx
 
-  in (out, t {schedule=newSchedule, raggedFX=newFX})
+      {- looks ugly but does the job :) -}
+      (raw, newSchedules) = mix $ map (mix . map continue) schedules
+
+      (out, newFX) = applyFX quartSamp raw raggedFX
+
+  in (out, t {schedules=newSchedules, raggedFX=newFX})
 
 
 
-fromTrack quartSamp inScope borders t@(Bus _ controls fx) =
+fromTrack quartSamp inScope speed borders t@(Bus _ controls fx) =
 
-  let sameWith = fromTrack quartSamp inScope borders
+  let sameWith = fromTrack quartSamp inScope speed borders
       continue (routing, track) =
         A.route routing `first` sameWith track
 
@@ -187,8 +189,13 @@ fill p@(Project {..}) =
   where quartSamp = noteSamples rate slider 4 tempi
         newSlider = tick rate slider buffLen tempi
         inScope x = chunkStart x < newSlider && chunkEnd x >= slider
-        borders start = (window rate slider start tempi, buffLen)
-        (out, newMaster) = fromTrack quartSamp inScope borders master
+
+        speed (Chunk {..}) = onMap / onSource
+          where onMap    = window rate chunkStart chunkEnd tempi
+                onSource = fromIntegral $ slaveEnd - slaveStart
+
+        borders start    = (window rate slider start tempi, buffLen)
+        (out, newMaster) = fromTrack quartSamp inScope speed borders master
 
 
 

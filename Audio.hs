@@ -23,12 +23,10 @@ empty = M.empty
 data OnDisk = Unloaded String | Loaded String Audio
 
 
-
 zeroedSlice :: Int -> Int -> Int -> Int -> F.Vector Float -> F.Vector Float
 zeroedSlice masterStart masterEnd start len vector =
   left F.++ F.slice start' len' vector F.++ right
-  where realStart = masterStart + start
-        start' = max 0 $ min masterEnd realStart
+  where start' = max 0 $ min masterEnd (masterStart + start)
         len' = min len $ masterEnd - start'
         leftLen = negate $ min start 0
         left = F.replicate leftLen 0
