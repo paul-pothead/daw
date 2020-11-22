@@ -9,7 +9,7 @@ import qualified Data.List as L
 import qualified Data.Map as M
 import qualified Data.Sequence as Q
 
-import Array (aget, aset, Array)
+import Array (aget, aset, Array, MultiIndex)
 
 compareBy f a b = f a `compare` f b
 
@@ -24,7 +24,7 @@ deleteTempo slider = filter $ (slider /=) . tempoStart
 
 addTempo :: Double -> Double -> [Tempo] -> [Tempo]
 addTempo slider bpm =
-  L.insertBy (compareBy tempoStart) (Tempo slider bpm)
+    L.insertBy (compareBy tempoStart) (Tempo slider bpm)
   . deleteTempo slider
 
 
@@ -63,7 +63,7 @@ window rate start end (t1 : ts)
   | null ts     = samples $ end - tempoStart t1
 
   | start >= tempoStart t2 = window rate start end ts
-  | end <= tempoStart t2 = samples $ end - tempoStart t1
+  | end <= tempoStart t2   = samples $ end - tempoStart t1
 
   | otherwise = samples (tempoStart t2 - tempoStart t1)
               + window rate (tempoStart t2) end ts
@@ -93,92 +93,71 @@ applyFX quartSamp =
     run effect quartSamp audio $ state effect)
 
 
-
 data Chunk = Chunk
   {chunkStart  :: Double,
    chunkEnd    :: Double,
-   link        :: [Int],
+   slaveStart  :: Int,
+   slaveEnd    :: Int,
+   speed       :: Double,
+   chunkFX     :: [Effect],
+   link        :: Either MultiIndex A.OnDisk,
    routing     :: A.Routing}
 
 
-pickChunks :: Double -> Double -> [Chunk] -> [Chunk]
-pickChunks from to schedule =
-  [x | x <- schedule, chunkStart x < to, chunkEnd x >= from]
 
 
 data Track = Bus
   {busName   :: String,
    controls  :: [(A.Routing, Track)],
-   busFX     :: [Effect],
-   busFrozen :: Maybe Source}
+   busFX     :: [Effect]}
   | Ragged
   {raggedName   :: String,
    schedule     :: [Chunk],
    raggedFX     :: [Effect],
-   pool         :: Array Source,
-   raggedFrozen :: Maybe Source}
-
-data Source = Source
-  {sourceName   :: String,
-   speed        :: Double,
-   sourceFX     :: [Effect],
-   audio        :: A.Audio}
+   pool         :: Array A.OnDisk}
 
 
 class Mixable m where
   mix :: [(A.Audio, m)] -> (A.Audio, [m])
   mix = first A.mixAudio . unzip
 
-instance Mixable Source
 instance Mixable Track
-
-
-class Tickable t where
-  
-
-fromSource :: Double -> (Double, Double) -> Source -> (A.Audio, Source)
-
-fromSource quartSamp (at, until) s@(Source _ speed fx audio) =
-  (out, s {sourceFX=newFX})
-
-  where at' = round $ at * speed
-        until' = round $ until * speed
-        toSend = A.sliceAudio at' until' audio
-        (out, newFX) = applyFX quartSamp toSend fx
-
+instance Mixable Chunk
 
 
 fromTrack :: Double
-          -> ([Chunk] -> [Chunk])
+          -> (Chunk -> Bool)
           -> (Double -> (Double, Double))
           -> Track
           -> (A.Audio, Track)
 
-fromTrack quartSamp _ borders t@(Ragged _ _ _ _ (Just f)) =
-  let (out, newFrozen) = fromSource quartSamp (borders 0) f
-  in (out, t {busFrozen=Just newFrozen})
+fromTrack quartSamp inScope borders t@(Ragged _ schedule fx pool) =
+
+  let continue c@(Chunk {..})
+        | inScope c = (out, c {chunkFX=newFX})
+        | otherwise = (A.empty, c)
+        where onDisk = either (aget pool) id link
+              source = case onDisk of
+                (A.Unloaded _) -> error "you shouldn't load on playback"
+                (A.Loaded _ source) -> source
+              realPos      = round . (speed *)
+              (at, len)    = bimap realPos realPos $ borders chunkStart
+              sliced       = A.sliceAudio slaveStart slaveEnd at len source
+              routed       = A.route routing sliced
+              (out, newFX) = applyFX quartSamp routed chunkFX
+      
+      (raw, newSchedule) = mix $ continue <$> schedule
+      (out, newFX) = applyFX quartSamp raw fx
+
+  in (out, t {schedule=newSchedule, raggedFX=newFX})
 
 
-fromTrack quartSamp inScope borders t@(Ragged _ schedule fx pool _) =
-  let continue (Chunk start _ link routing) = A.route routing `first`
-        fromSource quartSamp (borders start) (aget pool link)
 
-      visible = inScope $ schedule
-      (raw, newSources) = mix $ continue <$> visible
-      (out, newFX) = applyFX quartSamp raw $ fx
-      newPool = pool `aset` zip (link <$> visible) newSources
+fromTrack quartSamp inScope borders t@(Bus _ controls fx) =
 
-  in (out, t {raggedFX=newFX, pool=newPool})
-
-
-fromTrack quartSamp _ borders t@(Bus _ _ _ (Just f)) =
-  let (out, newFrozen) = fromSource quartSamp (borders 0) f
-  in (out, t {busFrozen=Just newFrozen})
-
-
-fromTrack quartSamp inScope borders t@(Bus _ controls fx _) =
-  let continue (routing, track) = A.route routing `first`
-        fromTrack quartSamp inScope borders track
+  let sameWith = fromTrack quartSamp inScope borders
+      continue (routing, track) =
+        A.route routing `first` sameWith track
 
       (raw, newTracks) = mix $ continue <$> controls
       nowControls = zip (fst <$> controls) newTracks
@@ -202,11 +181,8 @@ fill p@(Project {..}) =
 
   where quartSamp = noteSamples rate slider 4 tempi
         newSlider = tick rate slider buffLen tempi
-        inScope = pickChunks slider newSlider
-        borders start =
-          let at = window rate slider start tempi
-              until = at + buffLen
-          in (at, until)
+        inScope x = chunkStart x < newSlider && chunkEnd x >= slider
+        borders start = (window rate slider start tempi, buffLen)
         (out, newMaster) = fromTrack quartSamp inScope borders master
 
 

@@ -7,27 +7,37 @@ import Sound.File.Sndfile.Buffer.Vector (fromBuffer, toBuffer)
 import Control.Exception (try)
 
 
-type Audio = M.Map Int (F.Vector Double)
+{- Internal formats other than 4 byte floats per sample
+   are not supported, this is a design choice. -}
 
-{- This is written because either I don't understand something
-   or the default implementation of slice over storable 
-   vectors is buggy since it does not chop the start off  -}
+type Audio = M.Map Int (F.Vector Float)
+empty = M.empty
 
-slice :: Int -> Int -> F.Vector Double -> F.Vector Double
-slice start end =
-  F.slice 0 (end - start) . F.drop start
 
-zeroedSlice :: Int -> Int -> F.Vector Double -> F.Vector Double
-zeroedSlice start end vector =
-  left F.++ slice start' end' vector F.++ right
-  where start' = max start 0
-        end' = min end $ F.length vector
-        left = F.replicate (negate $ min 0 start) 0
-        right = F.replicate (max 0 $ end - F.length vector) 0
+{- I'm afraid, a more or less detailed guitar soundbank will
+   eat up 50GB minimum so we unload and load records into RAM
+   when editing a score, keeping those absolutely necessary for playback.
+   Another interesting option would be asynchronous import on playback,
+   but this will quickly turn into hell :) -}
 
-sliceAudio :: Int -> Int -> Audio -> Audio 
-sliceAudio start end =
-  M.map (zeroedSlice start end)
+data OnDisk = Unloaded String | Loaded String Audio
+
+
+
+zeroedSlice :: Int -> Int -> Int -> Int -> F.Vector Float -> F.Vector Float
+zeroedSlice masterStart masterEnd start len vector =
+  left F.++ F.slice start' len' vector F.++ right
+  where realStart = masterStart + start
+        start' = max 0 $ min masterEnd realStart
+        len' = min len $ masterEnd - start'
+        leftLen = negate $ min start 0
+        left = F.replicate leftLen 0
+        right = F.replicate (len - leftLen - len') 0
+
+
+sliceAudio :: Int -> Int -> Int -> Int -> Audio -> Audio 
+sliceAudio masterStart masterEnd start len =
+  M.map (zeroedSlice masterStart masterEnd start len)
 
 
 mixAudio :: [Audio] -> Audio
@@ -36,13 +46,15 @@ mixAudio = M.unionsWith $ F.zipWith (+)
 audioLength :: Audio -> Int
 audioLength = F.length . head . M.elems
 
-separate :: Int -> F.Vector Double -> Audio 
-separate n vector =
-  M.fromList
-    [(p, F.ifilter noMod $ F.drop p vector)
-     | p <- [1..n]]
-  where noMod p _ = p `mod` n == 0
 
+{- TODO check efficiency and possible alternatives -}
+separate :: Int -> F.Vector Float -> Audio 
+separate n vector = M.fromList
+  [(p, F.ifilter (\i _ -> i `mod` n == 0) $ F.drop p vector)
+   | p <- [0..n-1]]
+
+
+{- source and target ports respectively -}
 type Routing = M.Map Int Int
 
 
@@ -66,6 +78,5 @@ readAudio path = do
     Left (S.SystemError e) -> Nothing
     Right (info, samples) ->
       separate (S.channels info) . fromBuffer <$> samples
-
 
 
