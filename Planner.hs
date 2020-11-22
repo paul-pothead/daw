@@ -4,6 +4,7 @@ module Planner where
 
 import Data.Bifunctor
 
+import qualified Control.Exception as E
 import qualified Audio as A
 import qualified Data.List as L
 import qualified Data.Map as M
@@ -22,8 +23,8 @@ defaultTempi = [Tempo 0 120]
 deleteTempo :: Double -> [Tempo] -> [Tempo]
 deleteTempo slider = filter $ (slider /=) . tempoStart
 
-addTempo :: Double -> Double -> [Tempo] -> [Tempo]
-addTempo slider bpm =
+setTempo :: Double -> Double -> [Tempo] -> [Tempo]
+setTempo slider bpm =
     L.insertBy (compareBy tempoStart) (Tempo slider bpm)
   . deleteTempo slider
 
@@ -44,14 +45,18 @@ tick rate slider buffSamp (t1 : ts)
 
 
 softTempoChange :: Int -> Double -> [Tempo] -> [Tempo]
-softTempoChange n slider (t1 : tail@(t2 : ts))
+softTempoChange n slider (t1 : ts)
 
-  | slider < tempoStart t1 = t1 : softTempoChange n slider tail
+  | null ts || slider < tempoStart t1 =
+      E.throw $ E.IndexOutOfBounds ""
+
+  | slider >= tempoStart t2 = t1 : softTempoChange n slider ts
 
   | tempoStart t1 == slider = take n $ zipWith Tempo
-    [slider, slider + l ..] [bpm t1, bpm t1 + d ..] ++ tail
+    [slider, slider + l ..] [bpm t1, bpm t1 + d ..] ++ ts
   
-  where l = (tempoStart t2 - slider) / fromIntegral n
+  where t2 = head ts
+        l = (tempoStart t2 - slider) / fromIntegral n
         d = (bpm t2 - bpm t1) / fromIntegral n
 
 
